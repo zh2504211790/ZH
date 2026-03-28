@@ -1,0 +1,272 @@
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from bs4 import BeautifulSoup
+import time
+import random
+import csv
+import os
+import re
+import sys
+from datetime import datetime
+
+URLS = [
+    {"start_url": "https://gy.lianjia.com/chengjiao/nanmingqu/bp40ep55/", "name": "南明区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/nanmingqu/bp55ep70/", "name": "南明区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/nanmingqu/bp70ep100/", "name": "南明区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/nanmingqu/bp100ep10000/", "name": "南明区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/yunyanqu/bp0ep45/", "name": "云岩区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/yunyanqu/bp45ep65/", "name": "云岩区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/yunyanqu/bp65ep85/", "name": "云岩区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/yunyanqu/bp85ep125/", "name": "云岩区"},
+    {"start_url": "https://gy.lianjia.com/chengjiao/yunyanqu/bp125ep10000/", "name": "云岩区"},
+]
+OUTPUT_DIR = r"D:\Users\Desktop\房源数据"
+LOAD_TIMEOUT = 30
+MAX_RETRIES = 3
+SLEEP_RANGE = (0, 2)
+HEADLESS = False
+PER_PAGE_COUNT = 30
+
+class ProgressBar:
+    def __init__(self, total, prefix='', suffix='', length=50, fill='█', print_end="\r"):
+        self.total = total
+        self.prefix = prefix
+        self.suffix = suffix
+        self.length = length
+        self.fill = fill
+        self.print_end = print_end
+        self.current = 0
+        self.start_time = datetime.now()
+
+    def update(self, current):
+        self.current = current
+        percent = ("{0:.1f}").format(100 * (current / float(self.total)))
+        filled_length = int(self.length * current // self.total)
+        bar = self.fill * filled_length + '-' * (self.length - filled_length)
+        elapsed_time = (datetime.now() - self.start_time).total_seconds()
+        elapsed_time = max(elapsed_time, 0.001)
+        speed = current / elapsed_time
+        remaining_time = (self.total - current) / speed if speed > 0 else 0
+        time_info = f"速度: {speed:.2f}条/秒 | 剩余时间: {remaining_time:.0f}秒"
+        sys.stdout.write(f'\r{self.prefix} |{bar}| {percent}% {self.suffix} | {time_info}')
+        sys.stdout.flush()
+
+    def complete(self):
+        self.update(self.total)
+        print()
+
+def get_random_user_agent():
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/115.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Firefox/115.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.114 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.114 Safari/537.36 (Chrome-Lighthouse/10.3.0)",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/136.0.7103.114 Safari/537.36",
+    ]
+    return random.choice(user_agents)
+
+def validate_area(area_str):
+    if not area_str:
+        return "未知"
+    area_str = area_str.replace(" ", "")
+    if "平" in area_str:
+        num_str = ''.join(filter(str.isdigit, area_str))
+        if num_str:
+            num = float(num_str)
+            return f"{num:.2f}平"
+    return area_str
+
+def validate_price(price_str):
+    if not price_str:
+        return "0.00万元"
+    print(f"原始价格字符串: {price_str}")
+    cleaned_str = re.sub(r'[^\d.]', '', price_str)
+    if not cleaned_str:
+        return "0.00万元"
+    try:
+        num = float(cleaned_str) / 10
+        print(f"处理后的价格数值: {num}")
+        return f"{num:.2f}万元"
+    except ValueError:
+        print(f"无效价格格式: {price_str}")
+        return "0.00万元"
+
+def init_driver():
+    options = uc.ChromeOptions()
+    options.add_argument(f"--user-agent={get_random_user_agent()}")
+    if HEADLESS:
+        options.add_argument("--headless")
+    driver = uc.Chrome(options=options)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "delete navigator.webdriver;"
+    })
+    return driver
+
+def safe_load_page(driver, url, page_name):
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            driver.get(url)
+            WebDriverWait(driver, LOAD_TIMEOUT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".listContent"))
+            )
+            time.sleep(random.uniform(1, 2))
+            return driver.page_source
+        except Exception as e:
+            retries += 1
+            print(f"加载 {page_name} 失败，重试中...")
+            print(f"错误信息: {str(e)}")
+            driver.refresh()
+    return None
+
+def parse_houses(html_content, page_name, start_index, area_name):
+    if not html_content:
+        return [], start_index, None, 0
+    soup = BeautifulSoup(html_content, "html.parser")
+    items = soup.select(".listContent > li")
+    house_list = []
+    current_index = start_index
+    for item in items:
+        try:
+            title = item.select_one(".title a").text.strip()
+            deal_date = item.select_one(".dealDate").text.strip()
+            raw_total_price = item.select_one(".totalPrice span").text.strip()
+            total_price = validate_price(raw_total_price)
+            unit_price = item.select_one(".unitPrice").text.strip()
+            title_parts = title.split()
+            location = title_parts[0] if len(title_parts) >= 1 else "未知"
+            house_type = title_parts[1] if len(title_parts) >= 2 else "未知"
+            house_area = validate_area(title_parts[2]) if len(title_parts) >= 3 else "未知"
+            house_info = [part.strip() for part in item.select_one(".houseInfo").text.split("|")] if item.select_one(
+                ".houseInfo") else []
+            orientation = house_info[0] if len(house_info) >= 1 else "未知"
+            decoration = house_info[1] if len(house_info) >= 2 else "未知"
+            position_info = item.select_one(".positionInfo").text.strip()
+            floor_info = position_info.split("(")[0].strip() if "(" in position_info else position_info
+            house_data = {
+                "序号": str(current_index),
+                "区域": area_name,
+                "标题": title,
+                "位置": location,
+                "户型": house_type,
+                "房屋面积": house_area,
+                "成交日期": deal_date,
+                "总价": total_price,
+                "单价": unit_price,
+                "房屋朝向": orientation,
+                "所在楼层": floor_info,
+                "装修情况": decoration
+            }
+            house_list.append(house_data)
+            current_index += 1
+            print(f"解析：{title} - 总价{total_price}")
+        except Exception as e:
+            print(f"解析异常: {str(e)}")
+            continue
+    next_page_url = None
+    try:
+        page_box = soup.select_one(".house-lst-page-box")
+        if page_box:
+            next_btn = page_box.select_one(".next")
+            if next_btn and not next_btn.has_attr("disabled"):
+                next_page_url = next_btn.get("href")
+                if next_page_url and not next_page_url.startswith("http"):
+                    base_url = "https://gy.lianjia.com/chengjiao/"
+                    next_page_url = base_url + next_page_url
+    except Exception as e:
+        print(f"解析下一页URL失败: {str(e)}")
+    total_count = 0
+    total_count_elem = soup.select_one('div.total.fl')
+    if total_count_elem:
+        try:
+            total_count_text = total_count_elem.select_one('span').text
+            total_count = int(total_count_text.replace(',', ''))
+        except (ValueError, AttributeError):
+            print(f"解析 {area_name} 房源总数失败")
+    print(f"{page_name} 解析完成，共{len(house_list)}条数据，房源总数: {total_count}")
+    return house_list, current_index, next_page_url, total_count
+
+def save_to_csv(data, filename):
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    fieldnames = [
+        "序号", "区域", "标题", "位置", "户型", "房屋面积",
+        "成交日期", "总价", "单价", "房屋朝向",
+        "所在楼层", "装修情况"
+    ]
+    with open(filepath, "a", newline="", encoding="gb18030") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if f.tell() == 0:
+            writer.writeheader()
+        for row in data:
+            if not isinstance(row["总价"], str):
+                print(f"总价数据类型错误: {row['总价']}，类型为: {type(row['总价'])}")
+            writer.writerow(row)
+    print(f"保存{len(data)}条数据至{filename}")
+
+def crawl_area(driver, area_info, start_index):
+    start_url = area_info["start_url"]
+    area_name = area_info["name"]
+    csv_filename = f"{area_name}成交数据.csv"
+    print(f"\n开始爬取区域：{area_name}")
+    html_content = safe_load_page(driver, start_url, f"{area_name}-起始页")
+    if not html_content:
+        print(f"{area_name} 起始页加载失败，跳过")
+        return start_index
+    page_data, current_index, next_page_url, total_count = parse_houses(html_content, f"{area_name}-起始页", start_index, area_name)
+    save_to_csv(page_data, csv_filename)
+    if total_count == 0:
+        total_pages = 100
+    else:
+        total_pages = (total_count + PER_PAGE_COUNT - 1) // PER_PAGE_COUNT
+        print(f"{area_name} 总房源数: {total_count}，预计总页数: {total_pages}")
+    progress_bar = ProgressBar(total_pages, prefix=f'爬取进度 ({area_name})', suffix='完成')
+    progress_bar.update(1)
+    current_page = 2
+    while current_page <= total_pages:
+        parts = start_url.split("/")
+        area_part = parts[4]
+        param_part = "/".join(parts[5:])
+        current_url = f"https://gy.lianjia.com/chengjiao/{area_part}/pg{current_page}{param_part}"
+        print(f"\n开始爬取 {area_name}-第{current_page}页: {current_url}")
+        html_content = safe_load_page(driver, current_url, f"{area_name}-第{current_page}页")
+        if not html_content:
+            print(f"{area_name}-第{current_page}页加载失败，跳过")
+            current_page += 1
+            progress_bar.update(current_page - 1)
+            continue
+        page_data, current_index, _, _ = parse_houses(html_content, f"{area_name}-第{current_page}页", current_index,area_name)
+        save_to_csv(page_data, csv_filename)
+        current_page += 1
+        progress_bar.update(current_page - 1)
+        time.sleep(random.uniform(*SLEEP_RANGE))
+    progress_bar.complete()
+    print(f"{area_name} 所有页面爬取完成，共处理 {current_index - start_index} 条数据")
+    return current_index
+
+def main():
+    print("链家贵阳二手房爬取工具")
+    print(f"保存路径：{OUTPUT_DIR}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    driver = init_driver()
+    driver.get("https://gy.lianjia.com/chengjiao")
+    time.sleep(3)
+    current_index = 1
+    total_areas = len(URLS)
+    overall_progress = ProgressBar(total_areas, prefix='总进度', suffix='完成')
+    for i, area_info in enumerate(URLS):
+        print(f"\n开始爬取区域 {i + 1}/{total_areas}：{area_info['name']}")
+        current_index = crawl_area(driver, area_info, current_index)
+        print(f"{area_info['name']} 爬取完成")
+        overall_progress.update(i + 1)
+        wait_time = random.uniform(10, 15)
+        print(f"区域爬取完成，等待 {wait_time:.2f} 秒后继续...")
+        time.sleep(wait_time)
+    overall_progress.complete()
+    driver.quit()
+    print(f"全部完成，共处理{current_index - 1}条数据")
+
+if __name__ == "__main__":
+    main()
