@@ -1,0 +1,191 @@
+import requests
+import csv
+import os
+import time
+import json
+
+BAIDU_AK = "NvPfww9hq5TvlH9nnSuJ9UsjQnH7FYgL"
+BASE_URL = "http://api.map.baidu.com/place/v2/search"
+PAGE_SIZE = 20
+REQUEST_DELAY = 0.15
+MAX_RETRIES = 3
+TARGET_REGIONS = [
+    "花溪区", "贵安新区", "白云区", "云岩区", "乌当区",
+    "观山湖区", "清镇市", "南明区", "贵州双龙航空港经济区"
+]
+REGION_CODES = {
+    "花溪区": "520111",
+    "贵安新区": "520115",
+    "白云区": "520113",
+    "云岩区": "520103",
+    "乌当区": "520112",
+    "观山湖区": "520115",
+    "清镇市": "520181",
+    "南明区": "520102",
+    "贵州双龙航空港经济区": "520199"
+}
+SPECIAL_AREA_MAPPING = {
+    "贵安新区核心区": "贵安新区",
+    "双龙片区": "贵州双龙航空港经济区"
+}
+CATEGORY_MAPPING = {
+    "教育设施": {
+        "幼儿园": "幼儿园",
+        "小学": "小学",
+        "中学": "中学",
+        "大学": "大学",
+        "培训机构": "培训机构",
+        "特殊教育": "特殊教育学校"
+    },
+    "商业设施": {
+        "购物中心": "购物中心",
+        "超市": "超市",
+        "便利店": "便利店",
+        "餐饮": "餐厅",
+        "银行": "银行"
+    },
+    "政府机构": {
+        "政府机关": "政府",
+        "公安警察": "公安局",
+        "消防机构": "消防局",
+        "工商税务": "工商局"
+    },
+    "交通设施": {
+        "地铁站": "地铁站",
+        "公交站": "公交车站",
+        "停车场": "停车场",
+        "火车站": "火车站",
+        "高铁站": "高铁站",
+        "飞机场": "飞机场",
+        "充电站": "充电站"
+    },
+    "公园绿地": {
+        "公园": "公园",
+        "广场": "广场",
+        "风景区": "风景区",
+        "湿地公园": "湿地公园"
+    }
+}
+SAVE_PATH = r"C:\Users\25042\Desktop"
+CSV_FILENAME = "贵阳市全区域基础设施数据.csv"
+FULL_PATH = os.path.join(SAVE_PATH, CSV_FILENAME)
+
+def fetch_pois(category_name, subcategory_name, query_keyword, region):
+    page_num = 0
+    pois_list = []
+    retry_count = 0
+    while True:
+        params = {
+            "ak": BAIDU_AK,
+            "query": query_keyword,
+            "region": region,
+            "page_size": PAGE_SIZE,
+            "page_num": page_num,
+            "output": "json",
+            "scope": 2,
+            "city_limit": True
+        }
+        try:
+            time.sleep(REQUEST_DELAY)
+            response = requests.get(BASE_URL, params=params, timeout=25)
+            response.raise_for_status()
+            data = response.json()
+            status = data.get("status")
+            message = data.get("message", "")
+            if status != 0:
+                print(f"【{region}-{subcategory_name}】错误状态 {status}: {message}")
+                if status in [4, 302, 401]:
+                    print(f"【{region}-{subcategory_name}】因权限/配额问题终止")
+                    return pois_list
+                if status == 2:
+                    print(f"【{region}-{subcategory_name}】参数错误，终止采集")
+                    break
+                if retry_count < MAX_RETRIES:
+                    retry_count += 1
+                    print(f"【{region}-{subcategory_name}】重试 {retry_count}/{MAX_RETRIES}")
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"【{region}-{subcategory_name}】超过最大重试次数")
+                    break
+            pois = data.get("results", [])
+            if not pois:
+                print(f"【{region}-{subcategory_name}】无更多数据（共{page_num + 1}页）")
+                break
+            for poi in pois:
+                poi["main_category"] = category_name
+                poi["sub_category"] = subcategory_name
+                poi["region"] = region
+                poi["region_code"] = REGION_CODES.get(region, "")
+            pois_list.extend(pois)
+            print(f"【{region}-{subcategory_name}】第{page_num + 1}页 新增{len(pois)}条（累计{len(pois_list)}条）")
+            page_num += 1
+            retry_count = 0
+        except Exception as e:
+            print(f"【{region}-{subcategory_name}】请求异常: {str(e)}")
+            if retry_count < MAX_RETRIES:
+                retry_count += 1
+                print(f"【{region}-{subcategory_name}】重试 {retry_count}/{MAX_RETRIES}")
+                time.sleep(3)
+            else:
+                print(f"【{region}-{subcategory_name}】异常终止")
+                break
+    return pois_list
+
+def main():
+    print("开始采集贵阳市全区域基础设施数据")
+    print(f"目标区域: {', '.join(TARGET_REGIONS)}")
+    print("=" * 100)
+    all_pois = []
+    start_time = time.time()
+    total_count = 0
+    for region in TARGET_REGIONS:
+        print(f"\n正在处理区域：【{region}】")
+        print("-" * 80)
+        for category_name, subcategories in CATEGORY_MAPPING.items():
+            print(f"\n开始采集类别：{category_name}")
+            for sub_name, keyword in subcategories.items():
+                pois = fetch_pois(category_name, sub_name, keyword, region)
+                if pois:
+                    all_pois.extend(pois)
+                    total_count += len(pois)
+                    print(f"【{region}-{sub_name}】完成，累计总数据量：{total_count}条")
+    os.makedirs(SAVE_PATH, exist_ok=True)
+    if not all_pois:
+        print("\n未获取到任何数据，请检查AK有效性和网络连接")
+        return
+    with open(FULL_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        fieldnames = [
+            "区域", "区域代码", "名称", "纬度", "经度", "地址",
+            "主类别", "子类别", "详情URL"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for poi in all_pois:
+            location = poi.get("location", {})
+            detail_info = poi.get("detail_info", {})
+            area = poi.get("area", "")
+            for special_name, mapped_area in SPECIAL_AREA_MAPPING.items():
+                if special_name in area:
+                    poi["region"] = mapped_area
+            writer.writerow({
+                "区域": poi.get("region", ""),
+                "区域代码": poi.get("region_code", ""),
+                "名称": poi.get("name", ""),
+                "纬度": location.get("lat", ""),
+                "经度": location.get("lng", ""),
+                "地址": poi.get("address", ""),
+                "主类别": poi.get("main_category", ""),
+                "子类别": poi.get("sub_category", ""),
+                "详情URL": detail_info.get("detail_url", "")
+            })
+    duration = time.time() - start_time
+    minutes, seconds = divmod(duration, 60)
+    print("\n" + "=" * 100)
+    print(f"数据采集完成！总耗时：{int(minutes)}分{seconds:.1f}秒")
+    print(f"总数据量：{total_count}条（覆盖{len(TARGET_REGIONS)}个区域）")
+    print(f"保存路径：{FULL_PATH}")
+    print("=" * 100)
+
+if __name__ == "__main__":
+    main()
