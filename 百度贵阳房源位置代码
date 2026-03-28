@@ -1,0 +1,193 @@
+import pandas as pd
+import requests
+import time
+import os
+import json
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BAIDU_AK = "NvPfww9hq5TvlH9nnSuJ9UsjQnH7FYgL"
+GEOCODING_URL = "http://api.map.baidu.com/geocoding/v3/"
+CACHE_FILE = "geocode_cache.json"
+CITY = "贵阳市"
+cache_lock = threading.Lock()
+
+def remove_special_chars(text, region):
+    if not isinstance(text, str) or pd.isna(text):
+        return ""
+    cleaned = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9()\s]', '', text).strip()
+    if region and not pd.isna(region):
+        return f"{CITY}{region}{cleaned}"
+    return f"{CITY}{cleaned}"
+
+def get_geocode(address):
+    if not address or address.strip() == "":
+        return None, None, 0, 0
+    params = {
+        "address": address,
+        "city": CITY,
+        "output": "json",
+        "ak": BAIDU_AK,
+        "ret_coordtype": "bd09ll",
+        "extensions_poi": 1
+    }
+    debug_params = params.copy()
+    debug_params["ak"] = "***"
+    print(f"请求地址: {address} | 参数: {debug_params}")
+    for retry in range(3):
+        try:
+            time.sleep(0.5)
+            response = requests.get(GEOCODING_URL, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                status = data.get('status')
+                if status == 302:
+                    print("当日配额已用尽，终止解析")
+                    return None, None, -1, -1
+                if status == 0:
+                    result = data.get('result', {})
+                    location = result.get('location', {})
+                    precise = result.get('precise', 0)
+                    confidence = result.get('confidence', 0)
+                    print(f"成功解析: {address} | 纬度: {location.get('lat')}, 经度: {location.get('lng')}")
+                    return location.get('lat'), location.get('lng'), precise, confidence
+                else:
+                    print(f"API错误: {status} | 地址: {address} | 消息: {data.get('message')}")
+            else:
+                print(f"HTTP错误: {response.status_code} | 地址: {address}")
+        except Exception as e:
+            print(f"请求异常: {str(e)} | 地址: {address}")
+        if retry < 2:
+            time.sleep(1)
+    print(f"地址解析失败: {address} (重试3次未成功)")
+    return None, None, 0, 0
+
+def batch_geocode(addresses):
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                cache = json.load(f)
+            print(f"已加载缓存: {len(cache)} 条记录")
+        except Exception as e:
+            print(f"缓存加载失败: {str(e)}")
+    results = [None] * len(addresses)
+    quota_exhausted = False
+
+    def update_cache_and_results(addr, coords, idx):
+        nonlocal quota_exhausted
+        with cache_lock:
+            if coords[2] == -1:
+                quota_exhausted = True
+                return None
+            serializable_coords = {
+                'lat': coords[0],
+                'lng': coords[1],
+                'precise': coords[2],
+                'confidence': coords[3]
+            }
+            cache[addr] = serializable_coords
+            results[idx] = serializable_coords
+        return serializable_coords
+
+    def process_address(idx, addr):
+        addr_str = str(addr)
+        if addr_str in cache:
+            results[idx] = cache[addr_str]
+            return idx, cache[addr_str]
+        lat, lng, precise, confidence = get_geocode(addr_str)
+        coords = (lat, lng, precise, confidence)
+        return idx, update_cache_and_results(addr_str, coords, idx)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(process_address, idx, addr): idx
+            for idx, addr in enumerate(addresses)
+        }
+        completed_count = 0
+        total_count = len(futures)
+        for future in as_completed(futures):
+            try:
+                idx, coords = future.result()
+                completed_count += 1
+                if completed_count % 50 == 0 and not quota_exhausted:
+                    with cache_lock:
+                        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                            json.dump(cache, f, ensure_ascii=False)
+                    print(f"已保存缓存（{completed_count}/{total_count}）")
+                if quota_exhausted:
+                    print("检测到配额用尽，终止剩余任务")
+                    for f in futures:
+                        f.cancel()
+                    break
+            except Exception as e:
+                print(f"处理地址出错: {str(e)}")
+    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, ensure_ascii=False)
+    return results
+
+def main():
+    print("=" * 50)
+    print("开始处理数据 - 添加经纬度信息")
+    print("=" * 50)
+    input_path = r"C:\Users\25042\Desktop\数据1.0\贵阳二手房成交数据.csv"
+    try:
+        dtype_spec = {
+            '区域': str, '标题': str, '位置': str, '户型': str,
+            '房屋面积': str, '成交日期': str, '总价': str, '单价': str,
+            '房屋朝向': str, '所在楼层': str, '总楼层': str, '房屋结构': str,
+            '装修情况': str, '清洗地址': str, '纬度': float, '经度': float,
+            '精确度': int, '置信度': int, '数据来源区': str
+        }
+        df = pd.read_csv(input_path, encoding='gbk', dtype=dtype_spec)
+    except:
+        try:
+            df = pd.read_csv(input_path, encoding='utf-8', dtype=dtype_spec)
+        except Exception as e:
+            print(f"无法读取文件: {str(e)}")
+            return
+    print(f"原始数据加载完成: {len(df)} 行, {len(df.columns)} 列")
+    df['清洗地址'] = df.apply(lambda row: remove_special_chars(row['位置'], row['区域']), axis=1).fillna('')
+    addresses = df['清洗地址'].tolist()
+    print(f"\n开始处理 {len(addresses)} 个地址...")
+    coordinates = batch_geocode(addresses)
+    latitudes, longitudes, precisions, confidences = [], [], [], []
+    for coord in coordinates:
+        if coord:
+            latitudes.append(coord.get('lat'))
+            longitudes.append(coord.get('lng'))
+            precisions.append(coord.get('precise', 0))
+            confidences.append(coord.get('confidence', 0))
+        else:
+            latitudes.append(None)
+            longitudes.append(None)
+            precisions.append(0)
+            confidences.append(0)
+
+    df['纬度'] = latitudes
+    df['经度'] = longitudes
+    df['精确度'] = precisions
+    df['置信度'] = confidences
+    output_path = r"C:\Users\25042\Desktop\贵阳二手房成交数据-经纬度.csv"
+    try:
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"文件已保存至: {output_path}")
+    except Exception as e:
+        print(f"文件保存失败: {str(e)}")
+        documents_path = os.path.join(os.path.expanduser("~"), "Documents")
+        if not os.path.exists(documents_path):
+            documents_path = os.path.join(os.path.expanduser("~"), "文档")
+        backup_path = os.path.join(documents_path, "经纬度.csv")
+        df.to_csv(backup_path, index=False, encoding='utf_8_sig')
+        print(f"备份文件已保存至: {backup_path}")
+    success_count = df[['纬度', '经度']].notnull().all(axis=1).sum()
+    print("\n" + "=" * 50)
+    print(f"处理完成! 成功获取 {success_count}/{len(df)} 条经纬度")
+    print("=" * 50)
+    failed = df[df['纬度'].isnull()]
+    if not failed.empty:
+        print("\n失败案例预览 (前5条):")
+        print(failed[['位置', '清洗地址']].head())
+
+if __name__ == "__main__":
+    main()
