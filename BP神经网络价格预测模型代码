@@ -1,0 +1,207 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from sklearn.model_selection import cross_val_score, GridSearchCV, train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+import time
+import joblib
+import warnings
+
+warnings.filterwarnings('ignore')
+plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei"]
+plt.rcParams["axes.unicode_minus"] = False
+desktop_path = r"C:\Users\25042\Desktop"
+train_path = os.path.join(desktop_path, "训练集.csv")
+test_path = os.path.join(desktop_path, "测试集.csv")
+
+
+def load_data():
+    print("正在加载数据...")
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
+    print(f"训练集原始特征数量: {len(train.columns)}")
+    print(f"测试集原始特征数量: {len(test.columns)}")
+    return train, test
+
+def add_features(df):
+    df = df.copy()
+    if '房间数量' in df.columns and '厅数量' in df.columns:
+        df['房间总数'] = df['房间数量'] + df['厅数量']
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(0, inplace=True)
+    return df
+
+def prepare_data(train, test):
+    train = add_features(train)
+    test = add_features(test)
+    common_features = [col for col in train.columns if col in test.columns and col != '总价']
+    if '总价' not in train.columns or '总价' not in test.columns:
+        raise ValueError("数据集中缺少目标变量'总价'列！")
+    X_train = train[common_features]
+    y_train = train['总价']
+    X_test = test[common_features]
+    y_test = test['总价']
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    y_train_log = np.log1p(y_train)
+    y_test_log = np.log1p(y_test)
+    print(f"已对目标变量'总价'进行 log1p 转换")
+    print(f"已对所有特征进行标准化处理（神经网络必需）")
+    print(f"最终用于建模的特征数量: {len(common_features)}")
+    return X_train_scaled, X_test_scaled, y_train_log, y_test_log, y_test, scaler
+
+def train_bp_model(X_train, X_test, y_train_log, y_test_log, y_test_original, scaler):
+    CV_FOLDS = 5
+    RANDOM_STATE = 90
+    start_total_time = time.time()
+
+    print("\n[步骤 1/3] BP神经网络参数网格搜索（最优结构）...")
+    param_grid = {
+        'hidden_layer_sizes': [(64,32), (128,64), (64,32,16)],
+        'activation': ['relu', 'tanh'],
+        'solver': ['adam'],
+        'alpha': [0.001, 0.01],
+        'learning_rate_init': [0.001, 0.01]
+    }
+
+    bp_model = MLPRegressor(
+        random_state=RANDOM_STATE,
+        max_iter=1000,
+        early_stopping=True,
+        verbose=False
+    )
+
+    grid_search = GridSearchCV(
+        bp_model, param_grid,
+        cv=CV_FOLDS,
+        scoring='r2',
+        n_jobs=1,
+        verbose=1
+    )
+    grid_search.fit(X_train, y_train_log)
+    best_model = grid_search.best_estimator_
+    best_params = grid_search.best_params_
+
+    print(f"\n步骤1完成！BP神经网络最优参数：")
+    for k, v in best_params.items():
+        print(f"  {k}: {v}")
+    print(f"交叉验证最优 R²: {grid_search.best_score_:.4f}")
+
+    print("\n[步骤 2/3] 用最优模型预测测试集...")
+    y_pred_log = best_model.predict(X_test)
+    y_pred = np.expm1(y_pred_log)
+
+    result_df = pd.DataFrame({
+        '真实总价(万元)': y_test_original.values,
+        '预测总价(万元)': y_pred,
+        '绝对误差(万元)': y_pred - y_test_original.values,
+        'MAPE(%)': abs((y_pred - y_test_original.values) / (y_test_original.values + 1e-8)) * 100
+    })
+    mape_array = abs((y_pred - y_test_original) / (y_test_original + 1e-8))
+    total_samples = len(y_test_original)
+    mape_lt5 = mape_array[mape_array < 0.05]
+    count_lt5 = len(mape_lt5)
+    ratio_lt5 = (count_lt5 / total_samples) * 100
+    mape_lt10 = mape_array[mape_array < 0.1]
+    count_lt10 = len(mape_lt10)
+    ratio_lt10 = (count_lt10 / total_samples) * 100
+    mape_lt20 = mape_array[mape_array < 0.2]
+    count_lt20 = len(mape_lt20)
+    ratio_lt20 = (count_lt20 / total_samples) * 100
+    final_r2 = r2_score(y_test_original, y_pred)
+    final_mae = mean_absolute_error(y_test_original, y_pred)
+    final_mape = np.mean(mape_array) * 100
+    train_time = time.time() - start_total_time
+
+    print("\n" + "-" * 60)
+    print(f"BP神经网络训练时间: {train_time:.2f} 秒")
+    print(f"测试集 R²: {final_r2:.4f}")
+    print(f"平均绝对误差 MAE: {final_mae:.4f} 万元")
+    print(f"整体平均相对误差 MAPE: {final_mape:.2f} %")
+    print(f"\n不同精度阈值的样本统计：")
+    print(f"MAPE < 5% : {count_lt5:4d} / {total_samples}，占比: {ratio_lt5:.2f}%")
+    print(f"MAPE < 10%: {count_lt10:4d} / {total_samples}，占比: {ratio_lt10:.2f}%")
+    print(f"MAPE < 20%: {count_lt20:4d} / {total_samples}，占比: {ratio_lt20:.2f}%")
+    print("-" * 60)
+
+    print("\n[步骤 3/3] 生成图表并保存文件...")
+    model_package = {'model': best_model, 'scaler': scaler}
+    joblib.dump(model_package, os.path.join(desktop_path, '房价预测_BP模型.pkl'))
+    result_df.to_csv(os.path.join(desktop_path, '房价预测_BP结果.csv'), index=False, encoding='utf-8-sig')
+    pd.DataFrame.from_dict(best_params, orient='index', columns=['最优参数值']).to_csv(
+        os.path.join(desktop_path, 'BP模型最优参数.csv'), encoding='utf-8-sig')
+    plot_prediction_comparison(y_test_original, y_pred)
+    plot_loss_curve(best_model)
+
+    print(f"\n文件保存完成：")
+    print(f"1. 预测结果：房价预测_BP结果.csv")
+    print(f"2. 最优参数：BP模型最优参数.csv")
+    print(f"3. 模型文件：房价预测_BP模型.pkl")
+    return best_model, y_pred, best_params
+
+def plot_loss_curve(model):
+    plt.figure(figsize=(10, 6))
+    plt.plot(model.loss_curve_, label='训练损失', linewidth=2)
+    plt.xlabel('迭代次数')
+    plt.ylabel('损失值')
+    plt.title('BP神经网络训练损失曲线')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(desktop_path, 'BP神经网络损失曲线.png'), dpi=300)
+    plt.close()
+    print("BP神经网络损失曲线.png 已保存至桌面")
+
+def plot_prediction_comparison(y_true, y_pred):
+    plt.figure(figsize=(15, 8))
+    plt.plot(y_true.values, label='真实房价',
+             marker='o', markersize=3, linestyle='-', alpha=0.6)
+    plt.plot(y_pred, label='预测房价',
+             marker='x', markersize=3, linestyle='-', alpha=0.6)
+    plt.xlabel('测试集全部样本')
+    plt.ylabel('房价(万元)')
+    plt.title('BP神经网络-房价预测值与真实值对比')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(desktop_path, 'BP预测对比_全部样本.png'), dpi=300)
+    plt.close()
+    print("BP预测对比_全部样本.png 已保存至桌面")
+
+    plot_num = min(100, len(y_true))
+    plt.figure(figsize=(15, 8))
+    y_true_subset = y_true.values[:plot_num]
+    y_pred_subset = y_pred[:plot_num]
+    plt.plot(y_true_subset, label='真实房价',
+             marker='o', markersize=5, linestyle='-', linewidth=2, color='#1f77b4')
+    plt.plot(y_pred_subset, label='预测房价',
+             marker='x', markersize=5, linestyle='--', linewidth=2, color='#ff7f0e')
+    plt.xlabel('测试集样本(前100个)')
+    plt.ylabel('房价(万元)')
+    plt.title('BP神经网络-房价预测值与真实值对比')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(desktop_path, 'BP预测对比_前100样本.png'), dpi=300)
+    plt.close()
+    print("BP预测对比_前100样本.png已保存至桌面")
+
+def main():
+    print("=" * 60)
+    print("贵阳市房价预测 - BP神经网络版")
+    print("=" * 60)
+    train, test = load_data()
+    X_train, X_test, y_train_log, y_test_log, y_test_original, scaler = prepare_data(train, test)
+    print("\n当前模型使用的特征：")
+    for i, feat in enumerate([col for col in train.columns if col != '总价'], 1):
+        print(f"{i}. {feat}")
+    model, y_pred, best_params = train_bp_model(X_train, X_test, y_train_log, y_test_log, y_test_original, scaler)
+    print("\n全流程处理完成！")
+
+if __name__ == "__main__":
+    main()
