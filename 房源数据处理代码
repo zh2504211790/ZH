@@ -1,77 +1,154 @@
+import math
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import os
+import joblib
+from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer  # 用于空操作
-import joblib
+from sklearn.preprocessing import FunctionTransformer
 
+BASE_PATH = r"C:\Users\25042\Desktop\论文\数据2.0"
+HOUSE_FILE = os.path.join(BASE_PATH, "贵阳二手房位置-经纬度.csv")
+INFRA_FILE = os.path.join(BASE_PATH, "贵阳市全区域基础设施数据.csv")
+OUTPUT_PATH = r"C:\Users\25042\Desktop"
+
+COL_HOUSE_LAT = "纬度"
+COL_HOUSE_LON = "经度"
+COL_INFRA_LAT = "纬度"
+COL_INFRA_LON = "经度"
+COL_INFRA_NAME = "名称"
+COL_INFRA_CATEGORY = "子类别"
+DISTANCE_THRESHOLD = 1000
+
+VALID_ORIENTATIONS = ['东', '南', '西', '北', '东南', '西南', '东北', '西北']
 plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
-VALID_ORIENTATIONS = ['东', '南', '西', '北', '东南', '西南', '东北', '西北']
+
+def read_csv_auto_encoding(filepath):
+    encodings = ['utf-8', 'gbk', 'gb18030', 'utf-8-sig']
+    for enc in encodings:
+        try:
+            return pd.read_csv(filepath, encoding=enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    raise ValueError(f"无法读取文件 {filepath}")
+
+def haversine_vec(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2[:, None] - lat1
+    dlon = lon2[:, None] - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2[:, None]) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
+def calculate_infrastructure_features(df_house_input):
+    print("\n" + "=" * 60)
+    print("正在计算 1公里内基础设施特征...")
+    print("=" * 60)
+    try:
+        df_infra = read_csv_auto_encoding(INFRA_FILE)
+    except Exception as e:
+        print(f"读取基建数据失败: {e}，跳过此步骤")
+        return df_house_input
+
+    df_infra[COL_INFRA_LAT] = pd.to_numeric(df_infra[COL_INFRA_LAT], errors="coerce")
+    df_infra[COL_INFRA_LON] = pd.to_numeric(df_infra[COL_INFRA_LON], errors="coerce")
+    df_infra = df_infra.dropna(subset=[COL_INFRA_LAT, COL_INFRA_LON]).reset_index(drop=True)
+    df_house = df_house_input.copy()
+    temp_lats = pd.to_numeric(df_house[COL_HOUSE_LAT], errors="coerce").values
+    temp_lons = pd.to_numeric(df_house[COL_HOUSE_LON], errors="coerce").values
+    df_house['_temp_row_id'] = range(len(df_house))
+    has_category = COL_INFRA_CATEGORY in df_infra.columns
+    infra_categories = sorted(df_infra[COL_INFRA_CATEGORY].unique().tolist()) if has_category else []
+    BATCH_SIZE = 2000
+    num_batches = int(math.ceil(len(df_house) / BATCH_SIZE))
+    infra_results_list = []
+    for batch_idx in tqdm(range(num_batches), desc="计算进度"):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min((batch_idx + 1) * BATCH_SIZE, len(df_house))
+        batch_ids = df_house['_temp_row_id'].iloc[start_idx:end_idx].values
+        batch_lats = temp_lats[start_idx:end_idx]
+        batch_lons = temp_lons[start_idx:end_idx]
+        valid_mask = ~np.isnan(batch_lats) & ~np.isnan(batch_lons)
+        dist_matrix = None
+        if np.any(valid_mask):
+            dist_matrix = haversine_vec(batch_lats[valid_mask], batch_lons[valid_mask], df_infra[COL_INFRA_LAT].values, df_infra[COL_INFRA_LON].values)
+        for i in range(len(batch_ids)):
+            res = {'_temp_row_id': batch_ids[i]}
+            if valid_mask[i]:
+                lat1, lon1 = batch_lats[i], batch_lons[i]
+                if not np.isnan(lat1) and not np.isnan(lon1):
+                    lats2 = df_infra[COL_INFRA_LAT].values
+                    lons2 = df_infra[COL_INFRA_LON].values
+                    R = 6371000.0
+                    p1 = np.radians(lat1)
+                    p2 = np.radians(lats2)
+                    dp = np.radians(lats2 - lat1)
+                    dl = np.radians(lons2 - lon1)
+                    a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+                    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+                    dists = R * c
+                    nearby_mask = dists <= DISTANCE_THRESHOLD
+                    res['1公里内基建总数'] = int(np.sum(nearby_mask))
+                    if has_category:
+                        nearby_cats = df_infra.loc[nearby_mask, COL_INFRA_CATEGORY]
+                        cat_counts = nearby_cats.value_counts()
+                        for cat in infra_categories:
+                            res[f'1公里内_{cat}数量'] = int(cat_counts.get(cat, 0))
+                else:
+                    res['1公里内基建总数'] = 0
+            else:
+                res['1公里内基建总数'] = 0
+            infra_results_list.append(res)
+
+    df_infra_result = pd.DataFrame(infra_results_list)
+    df_final = pd.merge(df_house, df_infra_result, on='_temp_row_id', how='left')
+    df_final = df_final.drop('_temp_row_id', axis=1)
+    fill_cols = [c for c in df_final.columns if '1公里内' in c]
+    df_final[fill_cols] = df_final[fill_cols].fillna(0)
+    print("✅ 基础设施特征计算完成，已合并入数据")
+    return df_final
+
 def identity_transform(x):
     return x
 
-def main():
-    print("正在加载数据...")
-    data = load_data(r"C:\Users\25042\Desktop\数据2.0\贵阳二手房位置-经纬度.csv")
+def original_main_logic(data):
+    print("\n" + "=" * 60)
+    print("开始执行数据清洗与建模流程...")
+    print("=" * 60)
     print("\n正在进行数据类型转换...")
     data = convert_numeric_columns(data)
     print("\n正在清洗数据...")
     cleaned_data = clean_data(data)
     print("\n正在绘制楼层分布柱状图...")
-    plot_floor_distribution(cleaned_data, save_dir=r"C:\Users\25042\Desktop")
+    plot_floor_distribution(cleaned_data, save_dir=OUTPUT_PATH)
     print("\n正在绘制装修情况分布柱状图...")
-    plot_decoration_distribution(cleaned_data, save_dir=r"C:\Users\25042\Desktop")
+    plot_decoration_distribution(cleaned_data, save_dir=OUTPUT_PATH)
     print("\n正在绘制区域分布柱状图...")
-    plot_region_distribution(cleaned_data, save_dir=r"C:\Users\25042\Desktop")
+    plot_region_distribution(cleaned_data, save_dir=OUTPUT_PATH)
     print("\n正在绘制房屋朝向分布柱状图...")
-    plot_orientation_distribution(cleaned_data, save_dir=r"C:\Users\25042\Desktop")
+    plot_orientation_distribution(cleaned_data, save_dir=OUTPUT_PATH)
     print("\n正在进行特征工程...")
     engineered_data = engineer_features_and_handle_missing(cleaned_data)
-    print("\n正在绘制成交季节分布柱状图...")
-    plot_season_distribution(engineered_data, save_dir=r"C:\Users\25042\Desktop")
     check_data_quality(engineered_data)
     print("\n正在划分数据集...")
     X_train, X_test, y_train, y_test = split_data(engineered_data)
     print("\n正在进行特征转换...")
-    X_train_transformed, X_test_transformed, preprocessor, raw_lon_lat = transform_features(X_train, X_test)
+    X_train_transformed, X_test_transformed, preprocessor, raw_lon_lat, raw_time = transform_features(X_train, X_test)
     print("\n正在保存处理后的数据到桌面...")
-    save_dir = r"C:\Users\25042\Desktop"
-    save_processed_data(X_train_transformed, X_test_transformed,y_train, y_test, preprocessor, engineered_data.columns,raw_lon_lat, save_dir=save_dir)
+    save_processed_data(X_train_transformed, X_test_transformed, y_train, y_test, preprocessor, engineered_data.columns,
+                        raw_lon_lat, raw_time, save_dir=OUTPUT_PATH)
     if preprocessor is not None:
-        preprocessor_path = os.path.join(save_dir, 'preprocessor.joblib')
+        preprocessor_path = os.path.join(OUTPUT_PATH, 'preprocessor.joblib')
         joblib.dump(preprocessor, preprocessor_path)
         print(f"预处理管道已保存至: {preprocessor_path}")
     print("数据准备完成!")
     return X_train_transformed, X_test_transformed, y_train, y_test, preprocessor
-
-def load_data(file_path):
-    encodings = ['utf-8', 'gb2312', 'gbk']
-    target_cols = ['区域', '户型', '房屋面积', '总价', '单价', '房屋朝向',
-                   '所在楼层', '总楼层', '房屋结构', '装修情况', '清洗地址',
-                   '纬度', '经度', '精确度', '置信度', '成交日期']
-    for encoding in encodings:
-        try:
-            data = pd.read_csv(file_path, encoding=encoding)
-            missing_cols = [col for col in target_cols if col not in data.columns]
-            if missing_cols:
-                print(f"警告：数据中缺少以下字段：{missing_cols}，将尝试继续处理")
-            print(f"数据加载成功，使用编码: {encoding}")
-            print(f"数据行数: {len(data)}，列数: {len(data.columns)}")
-            print("数据列信息:")
-            print("{:<4} {:<15} {:<10} {:<10}".format("序号", "列名", "非空数量", "数据类型"))
-            for i, (col, dtype) in enumerate(zip(data.columns, data.dtypes)):
-                non_null = data[col].count()
-                print("{:<5} {:<16} {:<11} {:<10}".format(i + 1, col, non_null, str(dtype)))
-            return data
-        except UnicodeDecodeError:
-            continue
-    print(f"错误：无法读取文件 '{file_path}'（尝试编码：{encodings}）")
-    return pd.DataFrame()
 
 def convert_numeric_columns(data):
     converted = data.copy()
@@ -90,7 +167,7 @@ def convert_numeric_columns(data):
         print("已将'总楼层'转换为数值类型")
     for col in ['精确度', '置信度']:
         if col in cols:
-            converted[col] = pd.to_numeric(converted[col], errors='coerce')
+            converted[col] = pd.to_numeric(converted[col], errors="coerce")
             print(f"已将'{col}'转换为数值类型")
     if '经度' in cols:
         print("'经度'保持原始数据类型，不做转换")
@@ -105,10 +182,12 @@ def clean_data(data):
         print("警告：原始数据为空，无法清洗")
         return cleaned
     cols = cleaned.columns.tolist()
+    infra_cols = [c for c in cols if '1公里内' in c]
     keep_cols = ['区域', '户型', '房屋面积', '总价', '单价',
                  '房屋朝向', '所在楼层', '总楼层', '房屋结构',
-                 '装修情况', '清洗地址', '纬度', '经度',
-                 '精确度', '置信度', '成交日期']
+                 '装修情况', '纬度', '经度',
+                 '精确度', '置信度', '成交日期'] + infra_cols
+    keep_cols = list(dict.fromkeys(keep_cols)) 
     drop_cols = [col for col in cols if col not in keep_cols]
     if drop_cols:
         cleaned = cleaned.drop(drop_cols, axis=1)
@@ -145,8 +224,7 @@ def clean_data(data):
         invalid = cleaned['房屋朝向'].isna() | (cleaned['房屋朝向'] == '')
         if invalid.sum() > 0:
             cleaned = cleaned[~invalid]
-            print(f"过滤{invalid.sum()}条无效房屋朝向记录（无有效朝向）")
-        print(f"房屋朝向处理完成：已将多朝向拆分为独立朝向")
+            print(f"过滤{invalid.sum()}条无效房屋朝向记录")
     if '房屋结构' in cols:
         invalid = cleaned['房屋结构'].isna() | (cleaned['房屋结构'] == '暂无数据')
         if invalid.sum() > 0:
@@ -158,15 +236,13 @@ def clean_data(data):
             if invalid.sum() > 0:
                 cleaned = cleaned[~invalid]
                 print(f"过滤{invalid.sum()}条无效{num_col}记录")
-    missing = cleaned.isnull().sum()
-    print("缺失值统计（删除前）:\n", missing[missing > 0])
-    cleaned = cleaned.dropna(how='any')
+    if '成交日期' in cols:
+        cleaned['成交日期'] = pd.to_datetime(cleaned['成交日期'], errors='coerce')
+    key_cols = [c for c in ['房屋面积', '总价', '区域', '总楼层'] if c in cleaned.columns]
+    cleaned = cleaned.dropna(subset=key_cols, how='any')
     drop_missing = original - len(cleaned)
-    print(f"删除{drop_missing}条含缺失值的记录（总删除量）")
-    if cleaned.empty:
-        print("警告：清洗后数据为空")
-    else:
-        print(f"数据清洗完成：剩余{len(cleaned)}条记录（原始{original}条），已保留经度纬度")
+    print(f"删除{drop_missing}条关键字段缺失记录，无成交日期样本已保留")
+    print(f"数据清洗完成：剩余{len(cleaned)}条记录（原始{original}条）")
     return cleaned.reset_index(drop=True)
 
 def engineer_features_and_handle_missing(data):
@@ -176,35 +252,20 @@ def engineer_features_and_handle_missing(data):
     engineered = data.copy()
     cols = engineered.columns.tolist()
     original = len(engineered)
-    if '成交日期' in cols:
-        engineered['成交日期'] = pd.to_datetime(engineered['成交日期'], errors='coerce')
-        invalid_dates = engineered['成交日期'].isna()
-        if invalid_dates.sum() > 0:
-            engineered = engineered[~invalid_dates]
-            print(f"过滤{invalid_dates.sum()}条无效成交日期记录")
-        engineered['成交月份'] = engineered['成交日期'].dt.month
-        peak_months = {3, 4, 5, 9, 10, 11}
-        off_months = {1, 2, 6, 7, 8}
-        engineered['成交季节'] = engineered['成交月份'].apply(
-            lambda x: '旺季' if x in peak_months else '淡季' if x in off_months else '过渡月'
-        )
-        engineered.drop(['成交日期', '成交月份'], axis=1, inplace=True, errors='ignore')
-        print("日期特征处理完成：生成'成交季节'字段")
     if '户型' in cols:
         engineered['房间数量'] = engineered['户型'].str.extract(r'(\d+)室').astype(float)
         engineered['厅数量'] = engineered['户型'].str.extract(r'(\d+)厅').astype(float)
+        engineered = engineered.drop('户型', axis=1)
         print("户型特征处理完成：提取房间/厅数量")
+    if '成交日期' in cols:
+        engineered['成交月份'] = engineered['成交日期'].dt.month 
+        engineered = engineered.drop('成交日期', axis=1)
+        print("日期处理完成：仅生成【成交月份】，无年份，空值样本保留")
     if '房屋朝向' in cols:
         for orient in VALID_ORIENTATIONS:
-            engineered[f'朝向_{orient}'] = engineered['房屋朝向'].apply(
-                lambda x: 1 if orient in x.split() else 0
-            )
-        print(f"朝向特征处理完成：已为每个独立朝向生成热编码")
-    if '经度' in cols and '纬度' in cols:
-        print("特征工程中保留原始经度和纬度数据")
-    engineered = engineered.dropna(how='any')
-    drop_fe = original - len(engineered)
-    print(f"特征工程后删除{drop_fe}条含缺失值的记录，剩余{len(engineered)}条（保留经度纬度）")
+            engineered[f'朝向_{orient}'] = engineered['房屋朝向'].apply(lambda x: 1 if orient in str(x).split() else 0)
+        engineered = engineered.drop('房屋朝向', axis=1)
+    print(f"特征工程完成，剩余{len(engineered)}条记录")
     return engineered.reset_index(drop=True)
 
 def split_data(data):
@@ -220,16 +281,20 @@ def split_data(data):
         print(f"错误：数据量不足（仅{len(X)}条），无法划分训练集和测试集")
         return None, None, None, None
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    print(f"数据集划分完成: 训练集{len(X_train)}条，测试集{len(X_test)}条（均包含经度纬度）")
+    print(f"数据集划分完成: 训练集{len(X_train)}条，测试集{len(X_test)}条")
     return X_train, X_test, y_train, y_test
 
 def transform_features(X_train, X_test):
     if X_train is None or X_test is None or X_train.empty or X_test.empty:
         print("警告：训练集或测试集为空，无法进行特征转换")
-        return None, None, None, None
+        return None, None, None, None, None
     raw_lon_lat = {
-        'train': X_train[['经度', '纬度']].copy() if '经度' in X_train.columns and '纬度' in X_train.columns else None,
-        'test': X_test[['经度', '纬度']].copy() if '经度' in X_test.columns and '纬度' in X_test.columns else None
+        'train': X_train[['经度', '纬度']].copy() if '经度' in X_train.columns else None,
+        'test': X_test[['经度', '纬度']].copy() if '经度' in X_test.columns else None
+    }
+    raw_time = {
+        'train': X_train[['成交月份']].copy() if '成交月份' in X_train.columns else None,
+        'test': X_test[['成交月份']].copy() if '成交月份' in X_test.columns else None
     }
     nums = [col for col in X_train.select_dtypes(include=['int64', 'float64']).columns.tolist()
             if col not in ['纬度', '经度']]
@@ -249,14 +314,14 @@ def transform_features(X_train, X_test):
     )
     X_train_t = preprocessor.fit_transform(X_train_process)
     X_test_t = preprocessor.transform(X_test_process)
-    print(f"特征转换完成: 转换后特征维度={X_train_t.shape[1]}（数值特征未标准化，经度纬度保留原始形式）")
-    return X_train_t, X_test_t, preprocessor, raw_lon_lat
+    print(f"特征转换完成: 转换后特征维度={X_train_t.shape[1]}")
+    return X_train_t, X_test_t, preprocessor, raw_lon_lat, raw_time
 
-def save_processed_data(X_train, X_test, y_train, y_test, preprocessor, feature_names, raw_lon_lat, save_dir):
+def save_processed_data(X_train, X_test, y_train, y_test, preprocessor, feature_names, raw_lon_lat, raw_time, save_dir):
     if X_train is None or X_test is None or y_train is None or y_test is None:
         print("警告：数据不完整，无法保存处理后的数据")
         return
-    if preprocessor is not None and raw_lon_lat['train'] is not None and raw_lon_lat['test'] is not None:
+    if preprocessor is not None and raw_lon_lat['train'] is not None:
         num_feats = preprocessor.transformers_[0][2] if preprocessor else []
         cat_feats = preprocessor.transformers_[1][1].named_steps['onehot'].get_feature_names_out(
             preprocessor.transformers_[1][2]) if preprocessor else []
@@ -267,178 +332,88 @@ def save_processed_data(X_train, X_test, y_train, y_test, preprocessor, feature_
         X_train_filtered = X_train[:, keep_indices] if X_train.shape[1] > 0 else X_train
         X_test_filtered = X_test[:, keep_indices] if X_test.shape[1] > 0 else X_test
         train_df = pd.DataFrame(X_train_filtered, columns=filtered_feats)
-        train_df = pd.concat([train_df, raw_lon_lat['train'].reset_index(drop=True)], axis=1)  # 合并经度纬度
+        train_df = pd.concat([train_df, raw_lon_lat['train'].reset_index(drop=True)], axis=1)
+        if raw_time['train'] is not None:
+            train_df = pd.concat([train_df, raw_time['train'].reset_index(drop=True)], axis=1)
         train_df['总价'] = y_train.values
         test_df = pd.DataFrame(X_test_filtered, columns=filtered_feats)
-        test_df = pd.concat([test_df, raw_lon_lat['test'].reset_index(drop=True)], axis=1)  # 合并经度纬度
+        test_df = pd.concat([test_df, raw_lon_lat['test'].reset_index(drop=True)], axis=1)
+        if raw_time['test'] is not None:
+            test_df = pd.concat([test_df, raw_time['test'].reset_index(drop=True)], axis=1)
         test_df['总价'] = y_test.values
         train_df.to_csv(os.path.join(save_dir, '训练集.csv'), index=False, encoding='utf-8-sig')
         test_df.to_csv(os.path.join(save_dir, '测试集.csv'), index=False, encoding='utf-8-sig')
-        print(f"处理后数据已保存至: {save_dir}（包含原始经度、纬度，数值特征未标准化）")
-    if preprocessor is not None:
-        preprocessor_path = os.path.join(save_dir, 'preprocessor.joblib')
-        joblib.dump(preprocessor, preprocessor_path)
-        print(f"预处理管道已保存至: {preprocessor_path}")
+        print(f"✅ 数据已保存：仅包含【成交月份】，无年份，空值样本保留")
 
 def plot_floor_distribution(data, save_dir):
-    if '所在楼层' not in data.columns or data.empty:
-        print("警告：数据中不包含'所在楼层'列，无法绘制楼层分布柱状图")
-        return
-    floor_counts = data['所在楼层'].value_counts().reindex(['低楼层', '中楼层', '高楼层'], fill_value=0)
+    if '所在楼层' not in data.columns: return
+    cnt = data['所在楼层'].value_counts().reindex(['低楼层', '中楼层', '高楼层'], fill_value=0)
     plt.figure(figsize=(10, 6))
-    bars = plt.bar(floor_counts.index, floor_counts.values, color=['#5DA5DA', '#FAA43A', '#60BD68'])
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2., height + 5,
-                 f'{height}', ha='center', va='bottom', fontsize=12)
-    plt.title('二手房所在楼层分布', fontsize=16)
-    plt.xlabel('楼层类型', fontsize=14)
-    plt.ylabel('数量', fontsize=14)
-    plt.ylim(0, max(floor_counts.values) * 1.1 if max(floor_counts.values) > 0 else 1)
+    plt.bar(cnt.index, cnt.values, color=['#5DA5DA', '#FAA43A', '#60BD68'])
+    plt.title('二手房所在楼层分布')
+    plt.xlabel('楼层')
+    plt.ylabel('数量')
     plt.grid(axis='y', linestyle='--', alpha=0.7)
-    save_path = os.path.join(save_dir, '楼层分布柱状图.png')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    plt.savefig(os.path.join(save_dir, '楼层分布柱状图.png'), dpi=300)
     plt.close()
-    print(f"楼层分布柱状图已保存至: {save_path}")
 
 def plot_decoration_distribution(data, save_dir):
-    if '装修情况' not in data.columns or data.empty:
-        print("警告：数据中不包含'装修情况'列，无法绘制装修情况分布柱状图")
-        return
-    decoration_counts = data['装修情况'].value_counts().reindex(['毛坯', '简装', '精装'], fill_value=0)
+    if '装修情况' not in data.columns: return
+    cnt = data['装修情况'].value_counts().reindex(['毛坯', '简装', '精装'], fill_value=0)
     plt.figure(figsize=(10, 6))
-    bars = plt.bar(decoration_counts.index, decoration_counts.values, color=['#F17CB0', '#B2912F', '#B276B2'])
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2., height + 5,
-                 f'{height}', ha='center', va='bottom', fontsize=12)
-    plt.title('二手房装修情况分布', fontsize=16)
-    plt.xlabel('装修类型', fontsize=14)
-    plt.ylabel('数量', fontsize=14)
-    plt.ylim(0, max(decoration_counts.values) * 1.1 if max(decoration_counts.values) > 0 else 1)
+    plt.bar(cnt.index, cnt.values, color=['#F17CB0', '#B2912F', '#B276B2'])
+    plt.title('二手房装修情况分布')
+    plt.xlabel('装修')
+    plt.ylabel('数量')
     plt.grid(axis='y', linestyle='--', alpha=0.7)
-    save_path = os.path.join(save_dir, '装修情况分布柱状图.png')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    plt.savefig(os.path.join(save_dir, '装修情况分布柱状图.png'), dpi=300)
     plt.close()
-    print(f"装修情况分布柱状图已保存至: {save_path}")
 
 def plot_region_distribution(data, save_dir):
-    if '区域' in data.columns:
-        region_data = data['区域']
-    elif '清洗地址' in data.columns:
-        region_data = data['清洗地址'].str.split(r'[省市县区\- ]', n=2).str[1].str.strip()
-        invalid_regions = region_data.isna() | (region_data == '')
-        if invalid_regions.sum() > 0:
-            print(f"提示：从'清洗地址'提取区域时发现{invalid_regions.sum()}条无效数据，已过滤")
-            region_data = region_data[~invalid_regions]
-    else:
-        print("警告：数据中无'区域'或'清洗地址'列，无法绘制区域分布柱状图")
-        return
-    region_counts = region_data.value_counts().head(20)
-    if len(region_counts) == 0:
-        print("警告：未提取到有效区域数据，无法绘制区域分布柱状图")
-        return
+    if '区域' not in data.columns: return
+    cnt = data['区域'].value_counts().head(20)
     plt.figure(figsize=(12, 8))
-    bars = plt.barh(region_counts.index, region_counts.values, color='#5B86E5')
-    for bar in bars:
-        width = bar.get_width()
-        plt.text(width + 2, bar.get_y() + bar.get_height() / 2,
-                 f'{int(width)}', va='center', fontsize=10)
-    plt.title('二手房区域分布', fontsize=16)
-    plt.xlabel('房源数量', fontsize=14)
-    plt.ylabel('区域', fontsize=14)
-    plt.xlim(0, max(region_counts.values) * 1.1)
-    plt.grid(axis='x', linestyle='--', alpha=0.7)
-    save_path = os.path.join(save_dir, '区域分布柱状图.png')
+    plt.barh(cnt.index, cnt.values, color='#5B86E5')
+    plt.title('二手房区域分布')
+    plt.xlabel('数量')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, '区域分布柱状图.png'), dpi=300)
     plt.close()
-    print(f"区域分布柱状图已保存至: {save_path}")
-    print(f"显示前{len(region_counts)}个区域（共{region_data.nunique()}个 unique 区域）")
 
 def plot_orientation_distribution(data, save_dir):
-    if '房屋朝向' not in data.columns or data.empty:
-        print("警告：数据中不包含'房屋朝向'列，无法绘制朝向分布柱状图")
-        return
-    orientation_counts = {}
-    for orientations in data['房屋朝向']:
-        for orient in orientations.split():
-            orient = orient.strip()
-            orientation_counts[orient] = orientation_counts.get(orient, 0) + 1
-    orient_series = pd.Series(orientation_counts).reindex(VALID_ORIENTATIONS, fill_value=0)
-    orient_series = orient_series[orient_series > 0].sort_values(ascending=False)
+    if '房屋朝向' not in data.columns: return
+    d = {}
+    for s in data['房屋朝向'].dropna():
+        for o in str(s).split():
+            d[o] = d.get(o, 0) + 1
+    ser = pd.Series(d).reindex(VALID_ORIENTATIONS, fill_value=0).sort_values(ascending=False)
     plt.figure(figsize=(12, 6))
-    bars = plt.bar(orient_series.index, orient_series.values, color='#FF6B6B')
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2., height + 5,
-                 f'{int(height)}', ha='center', va='bottom', fontsize=12)
-    plt.title('二手房朝向分布（独立朝向统计）', fontsize=16)
-    plt.xlabel('朝向', fontsize=14)
-    plt.ylabel('出现次数', fontsize=14)
-    plt.ylim(0, max(orient_series.values) * 1.1 if max(orient_series.values) > 0 else 1)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    save_path = os.path.join(save_dir, '房屋朝向分布柱状图.png')
+    plt.bar(ser.index, ser.values, color='#FF6B6B')
+    plt.title('二手房朝向分布')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
+    plt.savefig(os.path.join(save_dir, '房屋朝向分布柱状图.png'), dpi=300)
     plt.close()
-    print(f"房屋朝向分布柱状图已保存至: {save_path}")
-
-def plot_season_distribution(data, save_dir):
-    if '成交季节' not in data.columns or data.empty:
-        print("警告：数据中不包含'成交季节'列，无法绘制成交季节分布柱状图")
-        return
-    season_counts = data['成交季节'].value_counts().reindex(['旺季', '淡季', '过渡月'], fill_value=0)
-    plt.figure(figsize=(10, 6))
-    bars = plt.bar(season_counts.index, season_counts.values, color=['#4D4D4D', '#969696', '#D9D9D9'])
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width() / 2., height + 5,
-                 f'{height}', ha='center', va='bottom', fontsize=12)
-    plt.title('二手房成交季节分布', fontsize=16)
-    plt.xlabel('季节类型', fontsize=14)
-    plt.ylabel('数量', fontsize=14)
-    plt.ylim(0, max(season_counts.values) * 1.1 if max(season_counts.values) > 0 else 1)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    save_path = os.path.join(save_dir, '成交季节分布柱状图.png')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    plt.close()
-    print(f"成交季节分布柱状图已保存至: {save_path}")
 
 def check_data_quality(data):
     if data.empty:
         print("\n数据质量检查：数据为空，无法检查")
         return
     print("\n数据质量检查（目标字段）:")
-    target_cols = ['区域', '户型', '房屋面积', '成交季节', '总价', '单价',
-                   '房屋朝向', '所在楼层', '总楼层', '房屋结构', '装修情况',
-                   '清洗地址', '纬度', '经度',
-                   '精确度', '置信度', '房间数量', '厅数量'] + \
-                  [f'朝向_{o}' for o in VALID_ORIENTATIONS]
+    target_cols = ['区域', '房屋面积', '总价', '单价', '所在楼层', '总楼层', '房屋结构', '装修情况', '纬度', '经度',
+                   '房间数量', '厅数量', '成交月份']
+    target_cols += [f'朝向_{o}' for o in VALID_ORIENTATIONS]
+    infra_cols = [c for c in data.columns if '1公里内' in c]
+    target_cols += infra_cols
     target_cols = [col for col in target_cols if col in data.columns]
     data_target = data[target_cols].copy()
-    missing = data_target.isnull().sum()
-    if missing.sum() > 0:
-        print("存在缺失值:\n", missing[missing > 0])
-    else:
-        print("无缺失值")
-    num_cols = ['房屋面积', '总价', '单价', '总楼层', '精确度', '置信度',
-                '房间数量', '厅数量', '纬度', '经度'] + [f'朝向_{o}' for o in VALID_ORIENTATIONS]
-    num_cols = [col for col in num_cols if col in data_target.columns]
-    if num_cols:
-        print("\n数值字段统计描述（含经度纬度，未标准化）:")
-        print(data_target[num_cols].describe().round(2))
-    cat_cols = ['区域', '户型', '成交季节', '房屋朝向', '所在楼层', '房屋结构', '装修情况', '清洗地址']
-    cat_cols = [col for col in cat_cols if col in data_target.columns]
-    for col in cat_cols:
-        unique = data_target[col].nunique()
-        sample = data_target[col].unique()[:5]
-        print(f"\n列'{col}'有{unique}个唯一值，示例: {sample}...")
+    print("无缺失值强制删除，成交月份空值已保留")
 
 if __name__ == "__main__":
-    X_train, X_test, y_train, y_test, preprocessor = main()
+    print("正在加载初始房源数据...")
+    raw_data = read_csv_auto_encoding(HOUSE_FILE)
+    data_with_infra = calculate_infrastructure_features(raw_data)
+    X_train, X_test, y_train, y_test, preprocessor = original_main_logic(data_with_infra)
     if X_train is not None:
-        print(f"\n最终数据集形状: 训练集{X_train.shape}，测试集{X_test.shape}（均包含原始经度纬度，数值特征未标准化）")
+        print(f"\n最终数据集形状: 训练集{X_train.shape}，测试集{X_test.shape}")
