@@ -2,16 +2,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-import multiprocessing  # 新增：Windows多进程必须的模块
 from sklearn.model_selection import cross_val_score, GridSearchCV, train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.ensemble import RandomForestRegressor
-from haversine import haversine
 import time
 import joblib
 import warnings
-from sklearn.neighbors import BallTree
-from sklearn.base import BaseEstimator, TransformerMixin
 
 warnings.filterwarnings('ignore')
 plt.rcParams["font.family"] = ["SimHei", "Microsoft YaHei"]
@@ -19,204 +15,154 @@ plt.rcParams["axes.unicode_minus"] = False
 desktop_path = r"C:\Users\25042\Desktop"
 train_path = os.path.join(desktop_path, "训练集.csv")
 test_path = os.path.join(desktop_path, "测试集.csv")
-facility_path = os.path.join(desktop_path, "贵阳市全区域基础设施数据.csv")
-GUIYANG_CENTER = (26.647, 106.630)
-class FacilityFeatureTransformer(BaseEstimator, TransformerMixin):
-    def __init__(self, facility_data, radius=1.0):
-        self.facility_data = facility_data
-        self.radius = radius
-        self.facility_categories = None
-        self.trees = {}
 
-    def fit(self, X, y=None):
-        self.facility_categories = self.facility_data['主类别'].unique()
-        facilities_rad = np.deg2rad(self.facility_data[['纬度', '经度']].values)
-        for category in self.facility_categories:
-            category_mask = (self.facility_data['主类别'] == category)
-            self.trees[category] = BallTree(facilities_rad[category_mask], metric='haversine')
-        return self
-
-    def transform(self, X, y=None):
-        X = X.copy()
-        house_rad = np.deg2rad(X[['纬度', '经度']].values)
-        r = self.radius / 6371
-        for cat, tree in self.trees.items():
-            count_list = tree.query_radius(house_rad, r=r, count_only=True)
-            X[f'设施_{cat}_1km'] = count_list
-        return X
 
 def load_data():
     print("正在加载数据...")
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
-    features = [
-        '房屋面积', '总楼层', '房间数量', '厅数量',
-        '朝向_东', '朝向_南', '朝向_西', '朝向_北',
-        '朝向_东南', '朝向_西南', '朝向_东北', '朝向_西北',
-        '所在楼层_中楼层', '所在楼层_低楼层', '所在楼层_高楼层',
-        '房屋结构_塔楼', '房屋结构_平房', '房屋结构_板塔结合', '房屋结构_板楼',
-        '装修情况_毛坯', '装修情况_简装', '装修情况_精装',
-        '成交季节_旺季', '成交季节_淡季', '成交季节_过渡月',
-        '总价', '纬度', '经度'
-    ]
-    valid_features_train = [col for col in features if col in train.columns]
-    valid_features_test = [col for col in features if col in test.columns]
-    train = train[valid_features_train]
-    test = test[valid_features_test]
-    encodings = ['gbk', 'gb2312', 'utf-8', 'utf-8-sig']
-    facilities = None
-    for enc in encodings:
-        try:
-            facilities = pd.read_csv(facility_path, encoding=enc)
-            break
-        except:
-            continue
-    facilities = facilities.dropna(subset=['纬度', '经度'])
-    facilities['纬度'] = pd.to_numeric(facilities['纬度'], errors='coerce')
-    facilities['经度'] = pd.to_numeric(facilities['经度'], errors='coerce')
-    facilities = facilities.dropna(subset=['纬度', '经度'])
-    return train, test, facilities
+    print(f"训练集原始特征数量: {len(train.columns)}")
+    print(f"测试集原始特征数量: {len(test.columns)}")
+    return train, test
+
 
 def add_features(df):
     df = df.copy()
-    df['单价'] = df['总价'] / df['房屋面积'].replace(0, np.nan)
-    df['房间总数'] = df['房间数量'] + df['厅数量']
-    df['距市中心距离'] = df.apply(lambda x: haversine((x['纬度'], x['经度']), GUIYANG_CENTER), axis=1)
+    if '房间数量' in df.columns and '厅数量' in df.columns:
+        df['房间总数'] = df['房间数量'] + df['厅数量']
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(0, inplace=True)
     return df
 
-def prepare_data(train, test, facilities):
+
+def prepare_data(train, test):
     train = add_features(train)
     test = add_features(test)
-    transformer = FacilityFeatureTransformer(facilities, radius=1.0)
-    train = transformer.fit_transform(train)
-    test = transformer.transform(test)
     common_features = [col for col in train.columns if col in test.columns and col != '总价']
+    if '总价' not in train.columns or '总价' not in test.columns:
+        raise ValueError("数据集中缺少目标变量'总价'列！")
     X_train = train[common_features]
     y_train = train['总价']
     X_test = test[common_features]
     y_test = test['总价']
-    return X_train, X_test, y_train, y_test
+    y_train_log = np.log1p(y_train)
+    y_test_log = np.log1p(y_test)
+    print(f"已对目标变量'总价'进行 log1p 转换")
+    print(f"最终用于建模的特征数量: {len(common_features)}")
+    return X_train, X_test, y_train_log, y_test_log, y_test
 
-def train_model_paper_strategy(X_train, X_test, y_train, y_test):
-    print("\n" + "=" * 60)
-    print("随机森林模型")
-    print("=" * 60)
+
+def train_model_paper_strategy(X_train, X_test, y_train_log, y_test_log, y_test_original):
     CV_FOLDS = 5
     RANDOM_STATE = 90
-    safe_config = {'n_jobs': 1, 'random_state': RANDOM_STATE, 'verbose': 0}
+    device_config = {'n_jobs': 1}
     best_params = {}
     start_total_time = time.time()
 
-    print("\n[步骤 1/5] 调优 n_estimators ...")
+    print("\n[步骤 1/6] 初始化：随机森林基础配置 ...")
+    print(f"已初始化随机森林模型")
+
+    print("\n[步骤 2/6] 确定 n_estimators (树的数量) ...")
     superpa = []
-    n_estimators_range = range(100, 500, 100)
+    n_estimators_range = range(100, 1100, 100)
     for i in n_estimators_range:
+        # 替换：随机森林
         model = RandomForestRegressor(
             n_estimators=i,
-            **safe_config
+            random_state=RANDOM_STATE,
+            verbose=0,
+            **device_config
         )
-        score = cross_val_score(model, X_train, y_train, cv=CV_FOLDS, scoring='r2', n_jobs=1).mean()
+        score = cross_val_score(model, X_train, y_train_log, cv=CV_FOLDS, scoring='r2').mean()
         superpa.append(score)
         print(f"n_estimators={i}, CV R²={score:.4f}")
     best_n_estimators_idx = superpa.index(max(superpa))
     best_n_estimators = list(n_estimators_range)[best_n_estimators_idx]
     best_params['n_estimators'] = best_n_estimators
-    print(f"\n步骤1完成：最优 n_estimators = {best_n_estimators}, 最高CV R² = {max(superpa):.4f}")
+    print(f"\n步骤2完成：最优 n_estimators = {best_n_estimators}, 最高CV R² = {max(superpa):.4f}")
     plt.figure(figsize=[20, 5])
     plt.plot(n_estimators_range, superpa, marker='o')
-    plt.title('n_estimators 学习曲线')
+    plt.title(f'n_estimators 学习曲线')
     plt.xlabel('n_estimators')
     plt.ylabel('CV R² Score')
     plt.grid(True)
-    plt.savefig(os.path.join(desktop_path, '步骤1_n_estimators学习曲线.png'), dpi=300)
+    plt.savefig(os.path.join(desktop_path, '步骤2_n_estimators学习曲线.png'), dpi=300)
     plt.close()
     print("学习曲线已保存至桌面")
 
-    print("\n[步骤 2/5] 粗调 max_depth & max_features ...")
-    param_grid_stage2 = {
-        'max_depth': np.arange(5, 11, 5),
-        'max_features': ['sqrt', 'log2', 0.5]
+    print("\n[步骤 3/6] 粗搜索：树结构参数 (max_depth, min_samples_split, max_features) ...")
+    param_grid_coarse = {
+        'max_depth': np.arange(3, 10, 2),
+        'max_features': ['sqrt', 'log2'],
+        'min_samples_split': [10, 20, 30]
     }
-    model_stage2 = RandomForestRegressor(
+    model_coarse = RandomForestRegressor(
         n_estimators=best_params['n_estimators'],
-        **safe_config
+        random_state=RANDOM_STATE,
+        verbose=0,
+        **device_config
     )
-    grid_stage2 = GridSearchCV(model_stage2, param_grid_stage2, cv=CV_FOLDS, scoring='r2', n_jobs=1, verbose=1)
-    grid_stage2.fit(X_train, y_train)
-    best_params['max_depth'] = grid_stage2.best_params_['max_depth']
-    best_params['max_features'] = grid_stage2.best_params_['max_features']
-    print(f"步骤2完成：粗调最优 max_depth={best_params['max_depth']}, max_features={best_params['max_features']}, CV R²={grid_stage2.best_score_:.4f}")
+    grid_coarse = GridSearchCV(model_coarse, param_grid_coarse, cv=CV_FOLDS, scoring='r2', n_jobs=1, verbose=1)
+    grid_coarse.fit(X_train, y_train_log)
+    coarse_md = grid_coarse.best_params_['max_depth']
+    coarse_mf = grid_coarse.best_params_['max_features']
+    coarse_mss = grid_coarse.best_params_['min_samples_split']
+    print(f"步骤3完成：粗搜区间中心 -> max_depth={coarse_md}, max_features={coarse_mf}, min_samples_split={coarse_mss}")
+    print(f"粗搜最佳 CV R² = {grid_coarse.best_score_:.4f}")
 
-    print("\n[步骤 3/5] 精调 max_depth & max_features ...")
-    current_md = best_params['max_depth']
-    current_mf = best_params['max_features']
-    if isinstance(current_mf, str):
-        mf_grid = [current_mf]
-    else:
-        mf_grid = [max(0.1, current_mf - 0.1), current_mf, min(1.0, current_mf + 0.1)]
-    param_grid_stage3 = {
-        'max_depth': [max(1, current_md - 2), current_md, current_md + 2],
-        'max_features': mf_grid
+    print("\n[步骤 4/6] 精搜索：遍历最优区间 ...")
+    param_grid_fine = {
+        'max_depth': [coarse_md - 1, coarse_md, coarse_md + 1],
+        'max_features': ['sqrt', 'log2'],
+        'min_samples_split': [coarse_mss - 5, coarse_mss, coarse_mss + 5]
     }
-    model_stage3 = RandomForestRegressor(
+    param_grid_fine['max_depth'] = [x for x in param_grid_fine['max_depth'] if x > 0]
+    param_grid_fine['min_samples_split'] = [x for x in param_grid_fine['min_samples_split'] if x > 1]
+    model_fine = RandomForestRegressor(
         n_estimators=best_params['n_estimators'],
-        **safe_config
+        random_state=RANDOM_STATE,
+        verbose=0,
+        **device_config
     )
-    grid_stage3 = GridSearchCV(model_stage3, param_grid_stage3, cv=CV_FOLDS, scoring='r2', n_jobs=1, verbose=1)
-    grid_stage3.fit(X_train, y_train)
-    best_params['max_depth'] = grid_stage3.best_params_['max_depth']
-    best_params['max_features'] = grid_stage3.best_params_['max_features']
-    print(f"步骤3完成：精调最优 max_depth={best_params['max_depth']}, max_features={best_params['max_features']}, CV R²={grid_stage3.best_score_:.4f}")
+    grid_fine = GridSearchCV(model_fine, param_grid_fine, cv=CV_FOLDS, scoring='r2', n_jobs=1, verbose=1)
+    grid_fine.fit(X_train, y_train_log)
+    best_params['max_depth'] = grid_fine.best_params_['max_depth']
+    best_params['max_features'] = grid_fine.best_params_['max_features']
+    best_params['min_samples_split'] = grid_fine.best_params_['min_samples_split']
+    print(
+        f"步骤4完成：精搜最优参数 -> max_depth={best_params['max_depth']}, max_features={best_params['max_features']}, min_samples_split={best_params['min_samples_split']}")
+    print(f"精搜最佳 CV R² = {grid_fine.best_score_:.4f}")
 
-    print("\n[步骤 4/5] 调优 min_samples_split & min_samples_leaf ...")
-    param_grid_stage4 = {
-        'min_samples_split': [2, 5, 10],
-        'min_samples_leaf': [1, 2, 4]
-    }
-    model_stage4 = RandomForestRegressor(
-        **best_params,
-        **safe_config
-    )
-    grid_stage4 = GridSearchCV(model_stage4, param_grid_stage4, cv=CV_FOLDS, scoring='r2', n_jobs=1, verbose=1)
-    grid_stage4.fit(X_train, y_train)
-    best_params['min_samples_split'] = grid_stage4.best_params_['min_samples_split']
-    best_params['min_samples_leaf'] = grid_stage4.best_params_['min_samples_leaf']
-    print(f"步骤4完成：最优 min_samples_split={best_params['min_samples_split']}, min_samples_leaf={best_params['min_samples_leaf']}")
+    print("\n[步骤 5/6] 提升精度：增加树数量强化模型 ...")
+    scale_factor = 2
+    final_n_estimators = best_params['n_estimators'] * scale_factor
+    print(f"初始 n_estimators: {best_params['n_estimators']} -> 最终 n_estimators: {final_n_estimators}")
 
-    print("\n[步骤 5/5] 调优 bootstrap 采样策略 ...")
-    param_grid_stage5 = [
-        {'bootstrap': [True], 'oob_score': [True, False]},
-        {'bootstrap': [False], 'oob_score': [False]}
-    ]
-    model_stage5 = RandomForestRegressor(
-        **best_params,
-        **safe_config
-    )
-    grid_stage5 = GridSearchCV(model_stage5, param_grid_stage5, cv=CV_FOLDS, scoring='r2', n_jobs=1, verbose=1)
-    grid_stage5.fit(X_train, y_train)
-    best_params['bootstrap'] = grid_stage5.best_params_['bootstrap']
-    best_params['oob_score'] = grid_stage5.best_params_['oob_score']
-    print(f"步骤5完成：最优 bootstrap={best_params['bootstrap']}, oob_score={best_params['oob_score']}")
-    print("\n" + "=" * 60)
-    print("  所有参数调优完成，开始训练最终随机森林模型")
-    print("=" * 60)
+    print("\n[步骤 6/6] 设定最优参数，训练最终模型 ...")
+    best_params_final = best_params.copy()
+    best_params_final['n_estimators'] = final_n_estimators
+    # 随机森林防过拟合参数
+    best_params_final['min_samples_leaf'] = 5
+    best_params_final['bootstrap'] = True
+
     time08 = time.time()
     final_model = RandomForestRegressor(
-        **best_params,
-        **safe_config
+        **best_params_final,
+        random_state=RANDOM_STATE,
+        verbose=0,
+        **device_config
     )
-    final_model.fit(X_train, y_train)
-    y_pred = final_model.predict(X_test)
+    final_model.fit(X_train, y_train_log)
+    y_pred_log = final_model.predict(X_test)
+    y_pred = np.expm1(y_pred_log)
     result_df = pd.DataFrame({
-        '真实总价(万元)': y_test.values,
+        '真实总价(万元)': y_test_original.values,
         '预测总价(万元)': y_pred,
-        '绝对误差(万元)': y_pred - y_test.values,
-        'MAPE(%)': abs((y_pred - y_test.values) / (y_test.values + 1e-8)) * 100
+        '绝对误差(万元)': y_pred - y_test_original.values,
+        'MAPE(%)': abs((y_pred - y_test_original.values) / (y_test_original.values + 1e-8)) * 100
     })
-    mape_array = abs((y_pred - y_test) / (y_test + 1e-8))
-    total_samples = len(y_test)
+    mape_array = abs((y_pred - y_test_original) / (y_test_original + 1e-8))
+    total_samples = len(y_test_original)
     mape_lt5 = mape_array[mape_array < 0.05]
     count_lt5 = len(mape_lt5)
     ratio_lt5 = (count_lt5 / total_samples) * 100
@@ -226,49 +172,51 @@ def train_model_paper_strategy(X_train, X_test, y_train, y_test):
     mape_lt20 = mape_array[mape_array < 0.2]
     count_lt20 = len(mape_lt20)
     ratio_lt20 = (count_lt20 / total_samples) * 100
-    rf_r2 = cross_val_score(final_model, X_train, y_train, cv=CV_FOLDS, scoring='r2', n_jobs=1).mean()
-    rf_mae = -cross_val_score(final_model, X_train, y_train, cv=CV_FOLDS, scoring='neg_mean_absolute_error', n_jobs=1).mean()
-    rf_mape = np.mean(mape_array) * 100
-    rf_time = time.time() - time08
+    final_r2 = r2_score(y_test_original, y_pred)
+    final_mae = mean_absolute_error(y_test_original, y_pred)
+    final_mape = np.mean(mape_array) * 100
+    lgbm8_time = time.time() - time08
     print("\n" + "-" * 60)
-    print("基于网格搜索优化后，随机森林 性能汇总：")
-    print(f"运行时间: {rf_time:.2f} 秒")
-    print(f"拟合优度 (CV R²): {rf_r2:.4f}")
-    print(f"平均绝对误差 (CV MAE): {rf_mae:.4f} 万元")
-    print(f"整体平均相对误差百分比 (MAPE): {rf_mape:.2f} %")
+    print(f"运行时间: {lgbm8_time:.2f} 秒")
+    print(f"测试集 R²: {final_r2:.4f}")
+    print(f"平均绝对误差 MAE: {final_mae:.4f} 万元")
+    print(f"整体平均相对误差 MAPE: {final_mape:.2f} %")
     print(f"\n不同精度阈值的样本统计：")
-    print(f"MAPE < 5% 的样本数量: {count_lt5} / {total_samples}，占比: {ratio_lt5:.2f}%")
-    print(f"MAPE < 10% 的样本数量: {count_lt10} / {total_samples}，占比: {ratio_lt10:.2f}%")
-    print(f"MAPE < 20% 的样本数量: {count_lt20} / {total_samples}，占比: {ratio_lt20:.2f}%")
+    print(f"MAPE < 5% : {count_lt5:4d} / {total_samples}，占比: {ratio_lt5:.2f}%")
+    print(f"MAPE < 10%: {count_lt10:4d} / {total_samples}，占比: {ratio_lt10:.2f}%")
+    print(f"MAPE < 20%: {count_lt20:4d} / {total_samples}，占比: {ratio_lt20:.2f}%")
     print("-" * 60)
-    print("\n正在生成输出图片...")
+    print("\n正在生成输出文件...")
     plot_feature_importance(final_model, X_train.columns)
-    plot_prediction_comparison(y_test, y_pred)
-    result_path = os.path.join(desktop_path, '房价预测结果.csv')
+
+    plot_prediction_comparison(y_test_original, y_pred)
+    result_path = os.path.join(desktop_path, '房价预测结果_随机森林.csv')
     result_df.to_csv(result_path, index=False, encoding='utf-8-sig')
     print(f"预测结果已保存至: {result_path}")
-    params_df = pd.DataFrame.from_dict(best_params, orient='index', columns=['最优参数值'])
+    params_df = pd.DataFrame.from_dict(best_params_final, orient='index', columns=['最优参数值'])
     params_df.index.name = '参数名称'
-    params_path = os.path.join(desktop_path, '模型最优参数.csv')
+    params_path = os.path.join(desktop_path, '模型最优参数_随机森林.csv')
     params_df.to_csv(params_path, encoding='utf-8-sig')
     print(f"最优参数表已保存至: {params_path}")
     model_path = os.path.join(desktop_path, '房价预测模型_随机森林.pkl')
     joblib.dump(final_model, model_path)
     print(f"模型已保存至: {model_path}")
-    return final_model, y_pred, best_params
+    return final_model, y_pred, best_params_final
+
 
 def plot_feature_importance(model, feature_names):
     importance = model.feature_importances_
-    indices = np.argsort(importance)[-15:]
-    plt.figure(figsize=(12, 8))
+    indices = np.argsort(importance)[-20:]
+    plt.figure(figsize=(12, 10))
     plt.barh(range(len(indices)), importance[indices], color='b', align='center')
     plt.yticks(range(len(indices)), [feature_names[i] for i in indices])
     plt.xlabel('特征重要性')
-    plt.title('随机森林特征重要性')
+    plt.title('随机森林特征重要性 Top 20')
     plt.tight_layout()
-    plt.savefig(os.path.join(desktop_path, '特征重要性.png'), dpi=300)
+    plt.savefig(os.path.join(desktop_path, '特征重要性_Top20_随机森林.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print("特征重要性.png 已保存至桌面")
+    print("特征重要性_Top20_随机森林.png 已保存至桌面")
+
 
 def plot_prediction_comparison(y_true, y_pred):
     plt.figure(figsize=(15, 8))
@@ -278,39 +226,45 @@ def plot_prediction_comparison(y_true, y_pred):
              marker='x', markersize=3, linestyle='-', alpha=0.6)
     plt.xlabel('测试集全部样本')
     plt.ylabel('房价(万元)')
-    plt.title('房价预测值与真实值对比（全部样本）')
+    plt.title('随机森林房价预测值与真实值对比')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(os.path.join(desktop_path, '预测对比（全部样本）.png'), dpi=300)
+    plt.savefig(os.path.join(desktop_path, '预测对比_全部样本.png'), dpi=300)
     plt.close()
-    print("预测对比（全部样本）.png 已保存至桌面")
-    plt.figure(figsize=(12, 6))
-    n_samples = min(100, len(y_true))
-    sample_idx = range(n_samples)
-    plt.plot(y_true.iloc[sample_idx].values, label='真实房价',
-             marker='o', markersize=4, linestyle='-', alpha=0.7)
-    plt.plot(y_pred[sample_idx], label='预测房价',
-             marker='x', markersize=4, linestyle='-', alpha=0.7)
-    plt.xlabel(f'测试集前{n_samples}样本')
+    print("预测对比_全部样本.png 已保存至桌面")
+
+    plot_num = min(100, len(y_true))
+    plt.figure(figsize=(15, 8))
+    y_true_subset = y_true.values[:plot_num]
+    y_pred_subset = y_pred[:plot_num]
+    plt.plot(y_true_subset, label='真实房价',
+             marker='o', markersize=5, linestyle='-', linewidth=2, color='#1f77b4')
+    plt.plot(y_pred_subset, label='预测房价',
+             marker='x', markersize=5, linestyle='--', linewidth=2, color='#ff7f0e')
+    plt.xlabel('测试集样本(前100个)')
     plt.ylabel('房价(万元)')
-    plt.title(f'房价预测值与真实值对比（前{n_samples}样本）')
+    plt.title('随机森林房价预测值与真实值对比')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(os.path.join(desktop_path, f'预测对比（前{n_samples}样本）.png'), dpi=300)
+    plt.savefig(os.path.join(desktop_path, '预测对比_前100样本.png'), dpi=300)
     plt.close()
-    print(f"预测对比（前{n_samples}样本）.png 已保存至桌面")
+    print("预测对比_前100样本.png已保存至桌面")
+
 
 def main():
     print("=" * 60)
-    print("  贵阳市房价预测 - 随机森林")
+    print("贵阳市房价预测 —— 随机森林版")
     print("=" * 60)
-    train, test, facilities = load_data()
-    X_train, X_test, y_train, y_test = prepare_data(train, test, facilities)
-    model, y_pred, best_params = train_model_paper_strategy(X_train, X_test, y_train, y_test)
+    train, test = load_data()
+    X_train, X_test, y_train_log, y_test_log, y_test_original = prepare_data(train, test)
+    print("\n当前模型使用的特征：")
+    for i, feat in enumerate(X_train.columns, 1):
+        print(f"{i}. {feat}")
+    model, y_pred, best_params = train_model_paper_strategy(X_train, X_test, y_train_log, y_test_log, y_test_original)
     print("\n全流程处理完成！")
 
+
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     main()
