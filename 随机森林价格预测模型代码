@@ -16,7 +16,6 @@ desktop_path = r"C:\Users\25042\Desktop"
 train_path = os.path.join(desktop_path, "训练集.csv")
 test_path = os.path.join(desktop_path, "测试集.csv")
 
-
 def load_data():
     print("正在加载数据...")
     train = pd.read_csv(train_path)
@@ -25,15 +24,11 @@ def load_data():
     print(f"测试集原始特征数量: {len(test.columns)}")
     return train, test
 
-
 def add_features(df):
     df = df.copy()
-    if '房间数量' in df.columns and '厅数量' in df.columns:
-        df['房间总数'] = df['房间数量'] + df['厅数量']
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(0, inplace=True)
     return df
-
 
 def prepare_data(train, test):
     train = add_features(train)
@@ -51,7 +46,6 @@ def prepare_data(train, test):
     print(f"最终用于建模的特征数量: {len(common_features)}")
     return X_train, X_test, y_train_log, y_test_log, y_test
 
-
 def train_model_paper_strategy(X_train, X_test, y_train_log, y_test_log, y_test_original):
     CV_FOLDS = 5
     RANDOM_STATE = 90
@@ -66,7 +60,6 @@ def train_model_paper_strategy(X_train, X_test, y_train_log, y_test_log, y_test_
     superpa = []
     n_estimators_range = range(100, 1100, 100)
     for i in n_estimators_range:
-        # 替换：随机森林
         model = RandomForestRegressor(
             n_estimators=i,
             random_state=RANDOM_STATE,
@@ -203,7 +196,6 @@ def train_model_paper_strategy(X_train, X_test, y_train_log, y_test_log, y_test_
     print(f"模型已保存至: {model_path}")
     return final_model, y_pred, best_params_final
 
-
 def plot_feature_importance(model, feature_names):
     importance = model.feature_importances_
     indices = np.argsort(importance)[-20:]
@@ -217,7 +209,6 @@ def plot_feature_importance(model, feature_names):
     plt.close()
     print("特征重要性_Top20_随机森林.png 已保存至桌面")
 
-
 def plot_prediction_comparison(y_true, y_pred):
     plt.figure(figsize=(15, 8))
     plt.plot(y_true.values, label='真实房价',
@@ -226,11 +217,11 @@ def plot_prediction_comparison(y_true, y_pred):
              marker='x', markersize=3, linestyle='-', alpha=0.6)
     plt.xlabel('测试集全部样本')
     plt.ylabel('房价(万元)')
-    plt.title('随机森林房价预测值与真实值对比')
+    plt.title('随机森林-房价预测值与真实值对比')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(os.path.join(desktop_path, '预测对比_全部样本.png'), dpi=300)
+    plt.savefig(os.path.join(desktop_path, '随机森林-预测对比_全部样本.png'), dpi=300)
     plt.close()
     print("预测对比_全部样本.png 已保存至桌面")
 
@@ -244,14 +235,13 @@ def plot_prediction_comparison(y_true, y_pred):
              marker='x', markersize=5, linestyle='--', linewidth=2, color='#ff7f0e')
     plt.xlabel('测试集样本(前100个)')
     plt.ylabel('房价(万元)')
-    plt.title('随机森林房价预测值与真实值对比')
+    plt.title('随机森林-房价预测值与真实值对比')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(os.path.join(desktop_path, '预测对比_前100样本.png'), dpi=300)
+    plt.savefig(os.path.join(desktop_path, '随机森林-预测对比_前100样本.png'), dpi=300)
     plt.close()
     print("预测对比_前100样本.png已保存至桌面")
-
 
 def main():
     print("=" * 60)
@@ -264,7 +254,6 @@ def main():
         print(f"{i}. {feat}")
     model, y_pred, best_params = train_model_paper_strategy(X_train, X_test, y_train_log, y_test_log, y_test_original)
     print("\n全流程处理完成！")
-
 
 if __name__ == "__main__":
     main()
