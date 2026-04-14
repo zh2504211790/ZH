@@ -187,7 +187,7 @@ def clean_data(data):
                  '房屋朝向', '所在楼层', '总楼层', '房屋结构',
                  '装修情况', '纬度', '经度',
                  '精确度', '置信度', '成交日期'] + infra_cols
-    keep_cols = list(dict.fromkeys(keep_cols)) 
+    keep_cols = list(dict.fromkeys(keep_cols))
     drop_cols = [col for col in cols if col not in keep_cols]
     if drop_cols:
         cleaned = cleaned.drop(drop_cols, axis=1)
@@ -258,7 +258,7 @@ def engineer_features_and_handle_missing(data):
         engineered = engineered.drop('户型', axis=1)
         print("户型特征处理完成：提取房间/厅数量")
     if '成交日期' in cols:
-        engineered['成交月份'] = engineered['成交日期'].dt.month 
+        engineered['成交月份'] = engineered['成交日期'].dt.month
         engineered = engineered.drop('成交日期', axis=1)
         print("日期处理完成：仅生成【成交月份】，无年份，空值样本保留")
     if '房屋朝向' in cols:
@@ -267,6 +267,7 @@ def engineer_features_and_handle_missing(data):
         engineered = engineered.drop('房屋朝向', axis=1)
     print(f"特征工程完成，剩余{len(engineered)}条记录")
     return engineered.reset_index(drop=True)
+
 
 def split_data(data):
     if data.empty:
@@ -280,8 +281,18 @@ def split_data(data):
     if len(X) < 5:
         print(f"错误：数据量不足（仅{len(X)}条），无法划分训练集和测试集")
         return None, None, None, None
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    print(f"数据集划分完成: 训练集{len(X_train)}条，测试集{len(X_test)}条")
+
+    y_bins = pd.qcut(y, q=7, labels=False, duplicates='drop')
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_bins
+    )
+    print(f"已采用【随机分层抽样】划分数据集")
+    print(f"划分比例: 80%训练集 / 20%测试集")
+    print(f"训练集: {len(X_train)}条，测试集: {len(X_test)}条")
+    print(f"训练集房价均值: {y_train.mean():.2f}万元，测试集房价均值: {y_test.mean():.2f}万元")
     return X_train, X_test, y_train, y_test
 
 def transform_features(X_train, X_test):
@@ -343,7 +354,7 @@ def save_processed_data(X_train, X_test, y_train, y_test, preprocessor, feature_
         test_df['总价'] = y_test.values
         train_df.to_csv(os.path.join(save_dir, '训练集.csv'), index=False, encoding='utf-8-sig')
         test_df.to_csv(os.path.join(save_dir, '测试集.csv'), index=False, encoding='utf-8-sig')
-        print(f"✅ 数据已保存：仅包含【成交月份】，无年份，空值样本保留")
+        print(f"数据已保存：仅包含【成交月份】，无年份，空值样本保留")
 
 def plot_floor_distribution(data, save_dir):
     if '所在楼层' not in data.columns: return
