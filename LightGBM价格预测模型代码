@@ -16,7 +16,6 @@ desktop_path = r"C:\Users\25042\Desktop"
 train_path = os.path.join(desktop_path, "训练集.csv")
 test_path = os.path.join(desktop_path, "测试集.csv")
 
-
 def load_data():
     print("正在加载数据...")
     train = pd.read_csv(train_path)
@@ -27,8 +26,6 @@ def load_data():
 
 def add_features(df):
     df = df.copy()
-    if '房间数量' in df.columns and '厅数量' in df.columns:
-        df['房间总数'] = df['房间数量'] + df['厅数量']
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(0, inplace=True)
     return df
@@ -229,7 +226,7 @@ def plot_prediction_comparison(y_true, y_pred):
              marker='x', markersize=3, linestyle='-', alpha=0.6)
     plt.xlabel('测试集全部样本')
     plt.ylabel('房价(万元)')
-    plt.title('房价预测值与真实值对比')
+    plt.title('LightGBM-房价预测值与真实值对比')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
@@ -247,7 +244,7 @@ def plot_prediction_comparison(y_true, y_pred):
              marker='x', markersize=5, linestyle='--', linewidth=2, color='#ff7f0e')
     plt.xlabel('测试集样本(前100个)')
     plt.ylabel('房价(万元)')
-    plt.title('房价预测值与真实值对比')
+    plt.title('LightGBM-房价预测值与真实值对比')
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
